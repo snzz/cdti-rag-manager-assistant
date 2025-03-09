@@ -180,6 +180,7 @@ sqlite.init_users_table()
 #
 
 curr_user_email = st.experimental_user.email
+st.write(curr_user_email)
 users_collection = sqlite.get_users()
 if not users_collection:
     users_collection = []
