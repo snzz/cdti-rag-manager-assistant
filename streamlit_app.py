@@ -1,56 +1,322 @@
-import streamlit as st
-from openai import OpenAI
+import os
+import uuid
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
+from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_pinecone import PineconeVectorStore
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.chains import RetrievalQA
+from langchain.chains.conversation.memory import ConversationBufferWindowMemory
+from langchain.prompts import (
+    SystemMessagePromptTemplate,
+    HumanMessagePromptTemplate,
+    ChatPromptTemplate,
+    MessagesPlaceholder
+)
+import streamlit as st
+from streamlit_chat import message
+import translators as ts
+
+import sqlite
+import utils
+from utils import *
+
+
+def on_add_profile_btn_click():
+    st.session_state.update()
+    if st.session_state['upd_prof_name'] == '':
+        st.error('Название профиля не может быть пустым')
+        return
+
+    curr_user_ = st.session_state['curr_user']
+    if len(curr_user_.profiles) > 10:
+        st.error('Превышен лимит количества профилей на пользователя: 10')
+        return
+
+    for profile_ in curr_user_.profiles:
+        if profile_.name == st.session_state['upd_prof_name']:
+            st.error('Профиль с таким названием уже существует')
+            return
+
+    global system_msg
+    curr_user_.profiles.append(sqlite.Profile(id=uuid.uuid4(), name=st.session_state['upd_prof_name'], history=[],
+                                              responses=["Чем я могу Вам помочь?"], requests=[],
+                                              prompt=system_msg))
+    sqlite.update_user(user=curr_user_)
+    st.session_state['curr_user'] = curr_user_
+    st.session_state['selected_profile_index'] += 1
+    st.session_state.update()
+    st.success(f"Профиль '{st.session_state['upd_prof_name']}' был успешно добавлен")
+
+
+def on_delete_profile_btn_click():
+    st.session_state.update()
+    curr_user_ = st.session_state['curr_user']
+    selected_profile_name_ = st.session_state["selected_profile_name"]
+
+    if len(curr_user_.profiles) <= 1:
+        st.error('Минимальное количество профилей: 1')
+        return
+
+    # with st.form("ProfileDeletingForm"):
+    #     st.write(f"Вы уверены, что хотите удалить профиль '{selected_profile_name_}'?")
+    #     form_button_col1, form_button_col2 = st.columns(2)
+    #     submitted = form_button_col1.form_submit_button("Удалить", use_container_width=True)
+    #     cancelled = form_button_col2.form_submit_button("Отмена", use_container_width=True)
+    #     if submitted:
+    for i_, profile_ in enumerate(curr_user_.profiles):
+        if profile_.name == selected_profile_name_:
+            del curr_user_.profiles[i_]
+            sqlite.update_user(curr_user_)
+            st.session_state['curr_user'] = curr_user_
+            break
+
+    st.session_state['selected_profile_index'] = len(curr_user_.profiles) - 1
+    st.session_state.update()
+    st.success(f"Профиль '{st.session_state["selected_profile_name"]}' был успешно удален")
+
+
+def on_change_profile_name_btn_click():
+    st.session_state.update()
+    curr_user_ = st.session_state['curr_user']
+    selected_profile_name_ = st.session_state["selected_profile_name"]
+
+    new_profile_name = st.session_state["upd_prof_name"]
+    if new_profile_name == '':
+        st.error('Название профиля не может быть пустым')
+        return
+
+    for profile_ in curr_user_.profiles:
+        if profile_.name == selected_profile_name_:
+            profile_.name = new_profile_name
+            sqlite.update_user(curr_user_)
+            st.session_state['curr_user'] = curr_user_
+            st.session_state.update()
+            break
+
+
+def on_clear_message_history_btn_click():
+    st.session_state.update()
+    curr_user_ = st.session_state['curr_user']
+    selected_profile_name_ = st.session_state["selected_profile_name"]
+
+    # with st.form("ProfileMessageHistoryClearingForm"):
+    #     st.write(f"Вы уверены, что хотите очистить историю сообщений профиля '{selected_profile_name_}'?")
+    #     form_button_col1, form_button_col2 = st.columns(2)
+    #     submitted = form_button_col1.form_submit_button("Удалить", use_container_width=True)
+    #     cancelled = form_button_col2.form_submit_button("Отмена", use_container_width=True)
+    #     if submitted:
+    for profile_ in curr_user_.profiles:
+        if profile_.name == selected_profile_name_:
+            profile_.history = []
+            profile_.responses = ["Чем я могу Вам помочь?"]
+            profile_.requests = []
+            st.session_state["history"] = profile_.history
+            st.session_state['responses'] = profile_.responses
+            st.session_state['requests'] = profile_.requests
+            sqlite.update_user(user=curr_user_)
+            st.session_state['curr_user'] = curr_user_
+            st.session_state.update()
+            break
+
+
+st.subheader("Ассистент-помощник руководителя ЦПТИ")
+
+if 'responses' not in st.session_state:
+    st.session_state['responses'] = ["Чем я могу Вам помочь?"]
+
+if 'requests' not in st.session_state:
+    st.session_state['requests'] = []
+
+### НАСТРОЙКА LLM
+os.environ['OPENAI_API_KEY'] = st.secrets["general"]["OPENAI_API_KEY"]
+index_name = 'cdti-admin-index'
+
+# OpenAI
+llm = ChatOpenAI(model_name="o3-mini")
+
+# DeepSeek
+# llm = ChatOpenAI(api_key='sk-73569156610e4ff6a3b5fc88b03c5799', base_url='https://api.deepseek.com')
+
+# ProxyAPI DeepSeek
+# llm = ChatOpenAI(model_name='o3-mini', api_key='sk-Du8PwFImWdVMNR6WFVqcLJh7uBiPdQUX', base_url='https://api.proxyapi.ru/openai/v1')
+
+if 'buffer_memory' not in st.session_state:
+    st.session_state.buffer_memory = ConversationBufferWindowMemory(k=4, return_messages=True)
+
+# Дефолтный промпт для ассистента
+system_msg = ("Ты помощник руководителя, знающий множество внутренних документов компании АО 'ЦПТИ', " +
+              "отвечай настолько, насколько возможно правдиво, " +
+              "исходя из текущего контекста. Контекст: {context}")
+system_msg_template = SystemMessagePromptTemplate.from_template(template=system_msg)
+
+human_msg_template = HumanMessagePromptTemplate.from_template(template="{question}")
+
+prompt_template = ChatPromptTemplate.from_messages(
+    [system_msg_template, MessagesPlaceholder(variable_name="history"), human_msg_template]
 )
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+embeddings = OpenAIEmbeddings(
+    model='text-embedding-3-large'
+)
+vectorstore = PineconeVectorStore.from_existing_index(index_name=index_name, embedding=embeddings)
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+qa = ConversationalRetrievalChain.from_llm(
+    llm=llm,
+    retriever=vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={'k': 6, 'lambda_mult': 0.25}
+    ),
+    return_source_documents=True,
+    verbose=True
+)
+qa.combine_docs_chain.llm_chain.prompt = prompt_template
+### НАСТРОЙКА LLM
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+# db
+# sqlite.clear_table(sqlite.db_name, 'Users')
+sqlite.init_users_table()
+#
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+curr_user_email = st.experimental_user.email
+users_collection = sqlite.get_users()
+if not users_collection:
+    users_collection = []
+st.session_state['users'] = users_collection
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+curr_user: sqlite.User | None = None
+for user in users_collection:
+    if user.email == curr_user_email:
+        curr_user = user
+        break
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+if not curr_user:
+    curr_user = sqlite.add_user(email=curr_user_email, profiles=[])
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
+if len(curr_user.profiles) == 0:
+    curr_user.profiles.append(sqlite.Profile(id=uuid.uuid4(), name='Новый профиль', history=[],
+                                             responses=["Чем я могу Вам помочь?"], requests=[],
+                                             prompt=system_msg))
+    sqlite.update_user(user=curr_user)
+
+st.session_state['curr_user'] = curr_user
+user_profiles_cb_values = list(map(lambda p: p.name, curr_user.profiles))
+if 'selected_profile_index' not in st.session_state:
+    st.session_state['selected_profile_index'] = 0
+
+st.session_state.update()
+st.selectbox(label='Выберите профиль:', options=user_profiles_cb_values, key='selected_profile_name',
+             index=st.session_state['selected_profile_index'])
+
+for i, profile in enumerate(curr_user.profiles):
+    if profile.name == st.session_state["selected_profile_name"]:
+        st.session_state["history"] = profile.history
+        st.session_state['responses'] = profile.responses
+        st.session_state['requests'] = profile.requests
+        st.session_state['prompt'] = profile.prompt
+        # st.session_state['selected_profile_index'] = i
+        break
+
+if st.session_state['prompt'] == '':
+    st.session_state['prompt'] = system_msg_template
+
+st.text_input('Введите название профиля:', key="upd_prof_name")
+st.session_state.update()
+
+prof_name_col1, prof_name_col2 = st.columns(2)
+prof_name_col1.button(label='Добавить новый профиль', use_container_width=True,
+                      icon='📃', on_click=on_add_profile_btn_click)
+prof_name_col2.button(label='Изменить название текущего профиля', use_container_width=True,
+                      icon='✍🏻', on_click=on_change_profile_name_btn_click)
+
+with st.expander('Удаление данных профиля', icon='❗'):
+    st.button(label='Удалить выбранный профиль', use_container_width=True, icon='❌',
+              on_click=on_delete_profile_btn_click, disabled=len(curr_user.profiles) == 0)
+    st.button(label='Очистить историю сообщений', use_container_width=True, icon='🧹',
+              on_click=on_clear_message_history_btn_click, disabled=len(curr_user.profiles) == 0)
+
+with st.expander('Параметры чата', icon='🔧'):
+    # Выбор элемента в ComboBox
+    st.session_state.update()
+    default_prompt_str = st.text_area('Стандартный промпт ассистента:', value=st.session_state['prompt'])
+    
+    if st.button('Сохранить', use_container_width=True):
+        if 'Контекст: {context}' not in default_prompt_str:
+            default_prompt_str += ' Контекст: {context}'
+
+        st.session_state['prompt'] = default_prompt_str
+        prompt_template = ChatPromptTemplate.from_messages(
+            [default_prompt_str, MessagesPlaceholder(variable_name="history"), human_msg_template]
         )
+        qa.combine_docs_chain.llm_chain.prompt = prompt_template
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        for i, profile in enumerate(curr_user.profiles):
+            if profile.name == st.session_state["selected_profile_name"]:
+                curr_user.profiles[i] = sqlite.Profile(id=profile.id, name=profile.name,
+                                                       history=st.session_state["history"],
+                                                       responses=st.session_state["responses"],
+                                                       requests=st.session_state["requests"],
+                                                       prompt=st.session_state['prompt'])
+                sqlite.update_user(curr_user)
+                break
+
+st.subheader('Чат')
+# container for chat history
+response_container = st.container()
+# container for text box
+textcontainer = st.container()
+
+with textcontainer:
+    query = st.text_input("Запрос: ", key="input", placeholder='Введите запрос')
+    if query.strip():
+        with st.spinner("Печатает..."):
+            formatted_history = [
+                HumanMessage(content=msg[0]) if i % 2 == 0 else AIMessage(content=msg[1])
+                for i, msg in enumerate(st.session_state["history"])
+            ]
+
+            # Добавление английской версии запроса для получение информации из англоязычных источников
+            processed_query = query
+            # processed_query = f' {ts.translate_text(query_text=query, translator='google', to_language='en')}'
+
+            response = qa(
+                {"question": processed_query, "history": formatted_history, "chat_history": formatted_history}
+            )
+
+            answer = utils.format_math_expressions(response["answer"])
+            # Перевод ответа на русский
+            # answer = ts.translate_text(query_text=answer, translator='yandex', to_language='ru')
+
+            # Сохранение вопроса и ответа в контексте
+            st.session_state["history"].append((processed_query, answer))
+
+            # Отображение источников
+            source_docs = []
+            answer += '\n\n**Источники:**'
+            for doc in response["source_documents"]:
+                doc_str = os.path.basename(doc.metadata.get('source', 'Неизвестный источник'))
+                doc_str = doc_str.replace('_', ' ')
+                doc_str = f'\n- {doc_str}'
+                if doc_str not in source_docs:
+                    source_docs.append(doc_str)
+                    answer += doc_str
+
+        st.session_state.requests.append(query)
+        st.session_state.responses.append(answer)
+        for profile in curr_user.profiles:
+            if profile.name == st.session_state["selected_profile_name"]:
+                profile = sqlite.Profile(id=profile.id, name=profile.name,
+                                         history=st.session_state["history"],
+                                         responses=st.session_state["responses"],
+                                         requests=st.session_state["requests"],
+                                         prompt=profile.prompt)
+                sqlite.update_user(curr_user)
+                break
+
+with response_container:
+    if st.session_state['responses']:
+        for i in range(len(st.session_state['responses'])):
+            message(st.session_state['responses'][i], key=str(i))
+            if i < len(st.session_state['requests']):
+                message(st.session_state["requests"][i], is_user=True, key=str(i) + '_user')

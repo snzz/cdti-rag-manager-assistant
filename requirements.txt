@@ -1,2 +1,13 @@
-streamlit
+streamlit==1.41.0
 openai
+torch
+langchain
+langchain-community
+streamlit_chat
+sentence-transformers
+pinecone==v5.4.2
+langchain_openai
+langchain_pinecone
+certifi
+translators==5.9.5
+deep-translator
