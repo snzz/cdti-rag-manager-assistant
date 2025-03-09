@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-db_name = 'cdti_rag_db.db'
+db_name = 'cdti_rag_admin_db.db'
 
 
 @dataclass
